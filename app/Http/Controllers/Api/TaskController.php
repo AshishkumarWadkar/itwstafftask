@@ -26,8 +26,11 @@ class TaskController extends Controller
             'repeat_days' => ['nullable', 'array'],
             'repeat_days.*' => ['in:Mon,Tue,Wed,Thu,Fri,Sat,Sun'],
             'reminder_before_minutes' => ['nullable', 'integer', 'min:0', 'max:720'],
-            'occurrences' => ['required', 'integer', 'min:1', 'max:12'],
-            'times_minutes' => ['required', 'array', 'min:1'],
+            // When a task "has ETA", the app sends time slots in times_minutes.
+            // When it does NOT have ETA, the app sends an empty/omitted times_minutes,
+            // and the task is treated as "any time".
+            'occurrences' => ['sometimes', 'integer', 'min:1', 'max:12'],
+            'times_minutes' => ['nullable', 'array'],
             'times_minutes.*' => ['integer', 'min:0', 'max:1439'],
             'assigned_user_ids' => ['required', 'array', 'min:1'],
             'assigned_user_ids.*' => ['integer', 'exists:users,id'],
@@ -38,13 +41,23 @@ class TaskController extends Controller
             'active' => ['boolean'],
         ]);
 
+        $minutes = array_values(array_unique(array_map('intval', $data['times_minutes'] ?? [])));
+        $minutes = array_values(array_filter($minutes, fn ($m) => is_int($m) && $m >= 0 && $m <= 1439));
+        sort($minutes);
+
+        // occurrences: prefer explicit occurrences, else derive from time slots, else 1 (no-ETA).
+        $occurrences = isset($data['occurrences'])
+            ? (int) $data['occurrences']
+            : (count($minutes) > 0 ? count($minutes) : 1);
+        $occurrences = max(1, min(12, $occurrences));
+
         $task = Task::create([
             'title' => $data['title'],
             'description' => $data['description'] ?? null,
             'repeat_type' => $data['repeat_type'],
             'repeat_days' => $data['repeat_days'] ?? null,
             'reminder_before_minutes' => $data['reminder_before_minutes'] ?? 0,
-            'occurrences' => $data['occurrences'],
+            'occurrences' => $occurrences,
             'capture_photo' => (bool)($data['capture_photo'] ?? false),
             'notify_once_done' => (bool)($data['notify_once_done'] ?? false),
             'overdue_alarm_enabled' => (bool)($data['overdue_alarm_enabled'] ?? false),
@@ -52,10 +65,9 @@ class TaskController extends Controller
             'active' => (bool)($data['active'] ?? true),
         ]);
 
-        $minutes = array_values(array_unique($data['times_minutes']));
-        sort($minutes);
+        // Store time slots only when present. If empty => "Anytime" task.
         foreach ($minutes as $i => $m) {
-            TaskTime::create(['task_id' => $task->id, 'occurrence_minutes' => $m, 'sort_order' => $i]);
+            TaskTime::create(['task_id' => $task->id, 'occurrence_minutes' => (int) $m, 'sort_order' => (int) $i]);
         }
 
         $task->users()->sync($data['assigned_user_ids']);
@@ -78,7 +90,8 @@ class TaskController extends Controller
             'repeat_days.*' => ['in:Mon,Tue,Wed,Thu,Fri,Sat,Sun'],
             'reminder_before_minutes' => ['nullable', 'integer', 'min:0', 'max:720'],
             'occurrences' => ['sometimes', 'integer', 'min:1', 'max:12'],
-            'times_minutes' => ['sometimes', 'array', 'min:1'],
+            // Allow empty times_minutes to represent "no ETA" (Anytime).
+            'times_minutes' => ['sometimes', 'nullable', 'array'],
             'times_minutes.*' => ['integer', 'min:0', 'max:1439'],
             'assigned_user_ids' => ['sometimes', 'array', 'min:1'],
             'assigned_user_ids.*' => ['integer', 'exists:users,id'],
@@ -94,10 +107,17 @@ class TaskController extends Controller
 
         if (isset($data['times_minutes'])) {
             $task->times()->delete();
-            $minutes = array_values(array_unique($data['times_minutes']));
+            $minutes = array_values(array_unique(array_map('intval', $data['times_minutes'] ?? [])));
+            $minutes = array_values(array_filter($minutes, fn ($m) => is_int($m) && $m >= 0 && $m <= 1439));
             sort($minutes);
             foreach ($minutes as $i => $m) {
-                TaskTime::create(['task_id' => $task->id, 'occurrence_minutes' => $m, 'sort_order' => $i]);
+                TaskTime::create(['task_id' => $task->id, 'occurrence_minutes' => (int) $m, 'sort_order' => (int) $i]);
+            }
+
+            // Keep occurrences aligned with ETA presence unless admin explicitly set it.
+            if (!isset($data['occurrences'])) {
+                $task->occurrences = count($minutes) > 0 ? count($minutes) : 1;
+                $task->save();
             }
         }
 
